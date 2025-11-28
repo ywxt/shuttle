@@ -21,6 +21,8 @@ pub use once::OnceState;
 pub use rwlock::RwLock;
 pub use rwlock::RwLockReadGuard;
 pub use rwlock::RwLockWriteGuard;
+pub use rwlock::MappedRwLockReadGuard;
+pub use rwlock::MappedRwLockWriteGuard;
 
 use std::fmt::{Debug, Display};
 use std::hash::{Hash, Hasher};

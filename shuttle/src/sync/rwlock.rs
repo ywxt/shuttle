@@ -5,6 +5,7 @@ use crate::runtime::thread;
 use crate::sync::{ResourceSignature, ResourceType};
 use std::cell::RefCell;
 use std::fmt::{Debug, Display};
+use std::mem::ManuallyDrop;
 use std::ops::{Deref, DerefMut};
 use std::panic::{RefUnwindSafe, UnwindSafe};
 use std::sync::{LockResult, PoisonError, TryLockError, TryLockResult};
@@ -336,6 +337,35 @@ pub struct RwLockReadGuard<'a, T: ?Sized> {
     me: TaskId,
 }
 
+impl<'a, T: ?Sized> RwLockReadGuard<'a, T> {
+    /// Makes a [`MappedRwLockReadGuard`] for a component of the borrowed data, e.g.
+    /// an enum variant.
+    ///
+    /// The `RwLock` is already locked for reading, so this cannot fail.
+    ///
+    /// This is an associated function that needs to be used as
+    /// `RwLockReadGuard::map(...)`. A method would interfere with methods of
+    /// the same name on the contents of the `RwLockReadGuard` used through
+    /// `Deref`.
+    ///
+    /// # Panics
+    ///
+    /// If the closure panics, the guard will be dropped (unlocked) and the RwLock will not be
+    /// poisoned.
+    pub fn map<U: ?Sized, F>(orig: Self, f: F) -> MappedRwLockReadGuard<'a, T, U>
+    where
+        F: FnOnce(&T) -> &U,
+    {
+        let mut orig = ManuallyDrop::new(orig);
+        let inner = std::sync::RwLockReadGuard::map(orig.inner.take().unwrap(), f);
+        MappedRwLockReadGuard {
+            inner: Some(inner),
+            rwlock: orig.rwlock,
+            me: orig.me,
+        }
+    }
+}
+
 impl<T: ?Sized> Deref for RwLockReadGuard<'_, T> {
     type Target = T;
 
@@ -387,6 +417,34 @@ pub struct RwLockWriteGuard<'a, T: ?Sized> {
     me: TaskId,
 }
 
+impl<'a, T: ?Sized> RwLockWriteGuard<'a, T> {
+    /// Makes a [`MappedRwLockWriteGuard`] for a component of the borrowed data, e.g.
+    /// an enum variant.
+    ///
+    /// The `RwLock` is already locked for writing, so this cannot fail.
+    ///
+    /// This is an associated function that needs to be used as
+    /// `RwLockWriteGuard::map(...)`. A method would interfere with methods of the
+    /// same name on the contents of the `RwLockWriteGuard` used through `Deref`.
+    ///
+    /// # Panics
+    ///
+    /// If the closure panics, the guard will be dropped (unlocked) and the RwLock will not be
+    /// poisoned.
+    pub fn map<U: ?Sized, F>(orig: Self, f: F) -> MappedRwLockWriteGuard<'a, T, U>
+    where
+        F: FnOnce(&mut T) -> &mut U,
+    {
+        let mut orig = ManuallyDrop::new(orig);
+        let inner = std::sync::RwLockWriteGuard::map(orig.inner.take().unwrap(), f);
+        MappedRwLockWriteGuard {
+            inner: Some(inner),
+            rwlock: orig.rwlock,
+            me: orig.me,
+        }
+    }
+}
+
 impl<T: ?Sized> Deref for RwLockWriteGuard<'_, T> {
     type Target = T;
 
@@ -414,6 +472,107 @@ impl<T: Display + ?Sized> Display for RwLockWriteGuard<'_, T> {
 }
 
 impl<T: ?Sized> Drop for RwLockWriteGuard<'_, T> {
+    fn drop(&mut self) {
+        self.rwlock.semaphore.release(RwLockType::Write.num_permits());
+
+        self.inner = None;
+
+        let mut state = self.rwlock.state.borrow_mut();
+        trace!(
+            holder = ?state.holder,
+            semaphore = ?self.rwlock.semaphore,
+            "releasing Write lock on rwlock {:p}",
+            self.rwlock
+        );
+        assert_eq!(state.holder, RwLockHolder::Write(self.me));
+        state.holder = RwLockHolder::None;
+        drop(state);
+    }
+}
+
+pub struct MappedRwLockReadGuard<'a, T: ?Sized, U: ?Sized> {
+    inner: Option<std::sync::MappedRwLockReadGuard<'a, U>>,
+    rwlock: &'a RwLock<T>,
+    me: TaskId,
+}
+
+impl<'a, T: ?Sized, U: ?Sized + Debug> Debug for MappedRwLockReadGuard<'a, T, U> {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        Debug::fmt(&self.inner.as_ref().unwrap(), f)
+    }
+}
+
+impl<'a, T: ?Sized, U: ?Sized + Display> Display for MappedRwLockReadGuard<'a, T, U> {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        (**self).fmt(f)
+    }
+}
+
+impl<'a, T: ?Sized, U: ?Sized> Deref for MappedRwLockReadGuard<'a, T, U> {
+    type Target = U;
+
+    fn deref(&self) -> &Self::Target {
+        self.inner.as_ref().unwrap().deref()
+    }
+}
+
+impl<'a, T: ?Sized, U: ?Sized> Drop for MappedRwLockReadGuard<'a, T, U> {
+    fn drop(&mut self) {
+        self.rwlock.semaphore.release(RwLockType::Read.num_permits());
+
+        self.inner = None;
+
+        let mut state = self.rwlock.state.borrow_mut();
+        trace!(
+            holder = ?state.holder,
+            semaphore = ?self.rwlock.semaphore,
+            "releasing Read lock on rwlock {:p}",
+            self.rwlock
+        );
+        let RwLockHolder::Read(readers) = &mut state.holder else {
+            panic!("exiting a reader but rwlock is in the wrong state {:?}", state.holder);
+        };
+        assert!(readers.remove(self.me));
+        if readers.is_empty() {
+            state.holder = RwLockHolder::None;
+        }
+        drop(state);
+    }
+}
+
+pub struct MappedRwLockWriteGuard<'a, T: ?Sized, U: ?Sized> {
+    inner: Option<std::sync::MappedRwLockWriteGuard<'a, U>>,
+    rwlock: &'a RwLock<T>,
+    me: TaskId,
+}
+
+impl<'a, T: ?Sized, U: ?Sized + Debug> Debug for MappedRwLockWriteGuard<'a, T, U> {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        Debug::fmt(&self.inner.as_ref().unwrap(), f)
+    }
+}
+
+impl<'a, T: ?Sized, U: ?Sized + Display> Display for MappedRwLockWriteGuard<'a, T, U> {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        (**self).fmt(f)
+    }
+}
+
+impl<'a, T: ?Sized, U: ?Sized> Deref for MappedRwLockWriteGuard<'a, T, U> {
+    type Target = U;
+
+    fn deref(&self) -> &Self::Target {
+        self.inner.as_ref().unwrap().deref()
+    }
+}
+
+impl<'a, T: ?Sized, U: ?Sized> DerefMut for MappedRwLockWriteGuard<'a, T, U> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.inner.as_mut().unwrap().deref_mut()
+    }
+}
+
+impl<'a, T: ?Sized, U: ?Sized> Drop for MappedRwLockWriteGuard<'a, T, U> {
     fn drop(&mut self) {
         self.rwlock.semaphore.release(RwLockType::Write.num_permits());
 
