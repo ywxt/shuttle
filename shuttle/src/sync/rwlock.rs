@@ -352,7 +352,7 @@ impl<'a, T: ?Sized> RwLockReadGuard<'a, T> {
     ///
     /// If the closure panics, the guard will be dropped (unlocked) and the RwLock will not be
     /// poisoned.
-    pub fn map<U: ?Sized, F>(orig: Self, f: F) -> MappedRwLockReadGuard<'a, T, U>
+    pub fn map<U: ?Sized, F>(orig: Self, f: F) -> MappedRwLockReadGuard<'a, U>
     where
         F: FnOnce(&T) -> &U,
     {
@@ -360,7 +360,8 @@ impl<'a, T: ?Sized> RwLockReadGuard<'a, T> {
         let inner = std::sync::RwLockReadGuard::map(orig.inner.take().unwrap(), f);
         MappedRwLockReadGuard {
             inner: Some(inner),
-            rwlock: orig.rwlock,
+            semaphore: &orig.rwlock.semaphore,
+            state: &orig.rwlock.state,
             me: orig.me,
         }
     }
@@ -431,7 +432,7 @@ impl<'a, T: ?Sized> RwLockWriteGuard<'a, T> {
     ///
     /// If the closure panics, the guard will be dropped (unlocked) and the RwLock will not be
     /// poisoned.
-    pub fn map<U: ?Sized, F>(orig: Self, f: F) -> MappedRwLockWriteGuard<'a, T, U>
+    pub fn map<U: ?Sized, F>(orig: Self, f: F) -> MappedRwLockWriteGuard<'a, U>
     where
         F: FnOnce(&mut T) -> &mut U,
     {
@@ -439,7 +440,8 @@ impl<'a, T: ?Sized> RwLockWriteGuard<'a, T> {
         let inner = std::sync::RwLockWriteGuard::map(orig.inner.take().unwrap(), f);
         MappedRwLockWriteGuard {
             inner: Some(inner),
-            rwlock: orig.rwlock,
+            semaphore: &orig.rwlock.semaphore,
+            state: &orig.rwlock.state,
             me: orig.me,
         }
     }
@@ -490,45 +492,48 @@ impl<T: ?Sized> Drop for RwLockWriteGuard<'_, T> {
     }
 }
 
-pub struct MappedRwLockReadGuard<'a, T: ?Sized, U: ?Sized> {
-    inner: Option<std::sync::MappedRwLockReadGuard<'a, U>>,
-    rwlock: &'a RwLock<T>,
+/// RAII structure used to release the shared read access of a lock when
+/// dropped, which can point to a subfield of the protected data.
+pub struct MappedRwLockReadGuard<'a, T: ?Sized> {
+    inner: Option<std::sync::MappedRwLockReadGuard<'a, T>>,
+    semaphore: &'a BatchSemaphore,
+    state: &'a RefCell<RwLockState>,
     me: TaskId,
 }
 
-impl<'a, T: ?Sized, U: ?Sized + Debug> Debug for MappedRwLockReadGuard<'a, T, U> {
+impl<'a, T: ?Sized + Debug> Debug for MappedRwLockReadGuard<'a, T> {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         Debug::fmt(&self.inner.as_ref().unwrap(), f)
     }
 }
 
-impl<'a, T: ?Sized, U: ?Sized + Display> Display for MappedRwLockReadGuard<'a, T, U> {
+impl<'a, T: ?Sized + Display> Display for MappedRwLockReadGuard<'a, T> {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         (**self).fmt(f)
     }
 }
 
-impl<'a, T: ?Sized, U: ?Sized> Deref for MappedRwLockReadGuard<'a, T, U> {
-    type Target = U;
+impl<'a, T: ?Sized> Deref for MappedRwLockReadGuard<'a, T> {
+    type Target = T;
 
     fn deref(&self) -> &Self::Target {
         self.inner.as_ref().unwrap().deref()
     }
 }
 
-impl<'a, T: ?Sized, U: ?Sized> Drop for MappedRwLockReadGuard<'a, T, U> {
+impl<'a, T: ?Sized> Drop for MappedRwLockReadGuard<'a, T> {
     fn drop(&mut self) {
-        self.rwlock.semaphore.release(RwLockType::Read.num_permits());
+        self.semaphore.release(RwLockType::Read.num_permits());
 
-        self.inner = None;
-
-        let mut state = self.rwlock.state.borrow_mut();
+        let mut state = self.state.borrow_mut();
         trace!(
             holder = ?state.holder,
-            semaphore = ?self.rwlock.semaphore,
+            semaphore = ?self.semaphore,
             "releasing Read lock on rwlock {:p}",
-            self.rwlock
+            self.inner.as_ref().unwrap(),
         );
+        self.inner = None;
+
         let RwLockHolder::Read(readers) = &mut state.holder else {
             panic!("exiting a reader but rwlock is in the wrong state {:?}", state.holder);
         };
@@ -540,51 +545,53 @@ impl<'a, T: ?Sized, U: ?Sized> Drop for MappedRwLockReadGuard<'a, T, U> {
     }
 }
 
-pub struct MappedRwLockWriteGuard<'a, T: ?Sized, U: ?Sized> {
-    inner: Option<std::sync::MappedRwLockWriteGuard<'a, U>>,
-    rwlock: &'a RwLock<T>,
+/// RAII structure used to release the exclusive write access of a lock when
+/// dropped, which can point to a subfield of the protected data.
+pub struct MappedRwLockWriteGuard<'a, T: ?Sized> {
+    inner: Option<std::sync::MappedRwLockWriteGuard<'a, T>>,
+    semaphore: &'a BatchSemaphore,
+    state: &'a RefCell<RwLockState>,
     me: TaskId,
 }
 
-impl<'a, T: ?Sized, U: ?Sized + Debug> Debug for MappedRwLockWriteGuard<'a, T, U> {
+impl<'a, T: ?Sized + Debug> Debug for MappedRwLockWriteGuard<'a, T> {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         Debug::fmt(&self.inner.as_ref().unwrap(), f)
     }
 }
 
-impl<'a, T: ?Sized, U: ?Sized + Display> Display for MappedRwLockWriteGuard<'a, T, U> {
+impl<'a, T: ?Sized + Display> Display for MappedRwLockWriteGuard<'a, T> {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        (**self).fmt(f)
+        Display::fmt(&self.inner.as_ref().unwrap(), f)
     }
 }
 
-impl<'a, T: ?Sized, U: ?Sized> Deref for MappedRwLockWriteGuard<'a, T, U> {
-    type Target = U;
+impl<'a, T: ?Sized> Deref for MappedRwLockWriteGuard<'a, T> {
+    type Target = T;
 
     fn deref(&self) -> &Self::Target {
         self.inner.as_ref().unwrap().deref()
     }
 }
 
-impl<'a, T: ?Sized, U: ?Sized> DerefMut for MappedRwLockWriteGuard<'a, T, U> {
+impl<'a, T: ?Sized> DerefMut for MappedRwLockWriteGuard<'a, T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.inner.as_mut().unwrap().deref_mut()
     }
 }
 
-impl<'a, T: ?Sized, U: ?Sized> Drop for MappedRwLockWriteGuard<'a, T, U> {
+impl<'a, T: ?Sized> Drop for MappedRwLockWriteGuard<'a, T> {
     fn drop(&mut self) {
-        self.rwlock.semaphore.release(RwLockType::Write.num_permits());
+        self.semaphore.release(RwLockType::Write.num_permits());
 
-        self.inner = None;
-
-        let mut state = self.rwlock.state.borrow_mut();
+        let mut state = self.state.borrow_mut();
         trace!(
             holder = ?state.holder,
-            semaphore = ?self.rwlock.semaphore,
+            semaphore = ?self.semaphore,
             "releasing Write lock on rwlock {:p}",
-            self.rwlock
+            self.inner.as_ref().unwrap(),
         );
+        self.inner = None;
         assert_eq!(state.holder, RwLockHolder::Write(self.me));
         state.holder = RwLockHolder::None;
         drop(state);
