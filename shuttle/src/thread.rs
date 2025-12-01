@@ -3,6 +3,7 @@
 use crate::runtime::execution::ExecutionState;
 use crate::runtime::task::TaskId;
 use crate::runtime::thread;
+use std::cell::Cell;
 use std::marker::PhantomData;
 use std::panic::Location;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -477,20 +478,20 @@ impl<T: 'static> LocalKey<T> {
     where
         F: FnOnce(&T) -> R,
     {
-        let value = self.get().unwrap_or_else(|| {
+        let value = self.internal_get().unwrap_or_else(|| {
             let value = (self.init)();
 
             ExecutionState::with(move |state| {
                 state.current_mut().init_local(self, value);
             });
 
-            self.get().unwrap()
+            self.internal_get().unwrap()
         })?;
 
         Ok(f(value))
     }
 
-    fn get(&'static self) -> Option<std::result::Result<&'static T, AccessError>> {
+    fn internal_get(&'static self) -> Option<std::result::Result<&'static T, AccessError>> {
         // Safety: see the usage below
         unsafe fn extend_lt<'b, T>(t: &'_ T) -> &'b T {
             std::mem::transmute(t)
@@ -509,6 +510,36 @@ impl<T: 'static> LocalKey<T> {
                 Some(Err(AccessError))
             }
         })
+    }
+}
+
+impl<T: 'static> LocalKey<Cell<T>> {
+    /// Returns a copy of the contained value.
+    ///
+    /// This will lazily initialize the value if this thread has not referenced
+    /// this key yet.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the key currently has its destructor running,
+    /// and it **may** panic if the destructor has previously been run for this thread.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::cell::Cell;
+    ///
+    /// thread_local! {
+    ///     static X: Cell<i32> = const { Cell::new(1) };
+    /// }
+    ///
+    /// assert_eq!(X.get(), 1);
+    /// ```
+    pub fn get(&'static self) -> T
+    where
+        T: Copy,
+    {
+        self.with(Cell::get)
     }
 }
 
