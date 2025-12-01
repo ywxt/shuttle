@@ -432,6 +432,19 @@ impl Builder {
     {
         Ok(spawn_named(f, self.name, self.stack_size, Location::caller()))
     }
+
+    /// Spawns a new scoped thread using the settings set through this `Builder`.
+    pub fn spawn_scoped<'scope, 'env, F, T>(
+        self,
+        scope: &'scope Scope<'scope, 'env>,
+        f: F,
+    ) -> std::io::Result<ScopedJoinHandle<'scope, T>>
+    where
+        F: FnOnce() -> T + Send + 'scope,
+        T: Send + 'scope,
+    {
+        Ok(scope.spawn(f))
+    }
 }
 
 /// A thread local storage key which owns its contents
