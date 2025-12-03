@@ -191,6 +191,7 @@ pub mod thread;
 
 pub mod current;
 pub mod scheduler;
+pub mod scoped_tls;
 
 mod runtime;
 
