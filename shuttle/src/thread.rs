@@ -3,7 +3,7 @@
 use crate::runtime::execution::ExecutionState;
 use crate::runtime::task::TaskId;
 use crate::runtime::thread;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::marker::PhantomData;
 use std::panic::Location;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -524,6 +524,51 @@ impl<T: 'static> LocalKey<T> {
             }
         })
     }
+
+    /// Acquires a reference to the value in this TLS key, initializing it with
+    /// `init` if it wasn't already initialized on this thread.
+    ///
+    /// If `init` was used to initialize the thread local variable, `None` is
+    /// passed as the first argument to `f`. If it was already initialized,
+    /// `Some(init)` is passed to `f`.
+    ///
+    /// # Panics
+    ///
+    /// This function will panic if the key currently has its destructor
+    /// running, and it **may** panic if the destructor has previously been run
+    /// for this thread.
+    fn initialize_with<F, R>(&'static self, init: T, f: F) -> R
+    where
+        F: FnOnce(Option<T>, &T) -> R,
+    {
+        // Safety: see the usage below
+        unsafe fn extend_lt<'b, T>(t: &'_ T) -> &'b T {
+            std::mem::transmute(t)
+        }
+
+        let mut init = Some(init);
+
+        let reference = ExecutionState::with(|state| {
+            if state.current().local(self).is_none() {
+                state.current_mut().init_local(self, init.take().unwrap());
+            }
+            match state.current().local(self) {
+                // Safety: unfortunately the lifetime of a value in our thread-local storage is
+                // bound to the lifetime of `ExecutionState`, which has no visible relation to the
+                // lifetime of the thread we're running on. However, *we* know that the
+                // `ExecutionState` outlives any thread, including the caller, and so it's safe to
+                // give the caller the lifetime it's asking for here.
+                Some(Ok(r)) => unsafe { extend_lt(r) },
+                Some(Err(_)) => panic!(
+                    "cannot access a Thread Local Storage value \
+                                                  during or after destruction"
+                ),
+                None => unreachable!(),
+            }
+        });
+
+        f(init, reference)
+    }
 }
 
 impl<T: 'static> LocalKey<Cell<T>> {
@@ -555,10 +600,11 @@ impl<T: 'static> LocalKey<Cell<T>> {
         self.with(Cell::get)
     }
 
-    /// Sets the contained value.
+    /// Sets or initializes the contained value.
     ///
-    /// This will lazily initialize the value if this thread has not referenced
-    /// this key yet.
+    /// Unlike the other methods, this will *not* run the lazy initializer of
+    /// the thread local. Instead, it will be directly initialized with the
+    /// given value if it wasn't initialized yet.
     ///
     /// # Panics
     ///
@@ -569,15 +615,53 @@ impl<T: 'static> LocalKey<Cell<T>> {
     ///
     /// ```
     /// use std::cell::Cell;
+    ///
+    /// thread_local! {
+    ///     static X: Cell<i32> = panic!("!");
+    /// }
+    ///
+    /// // Calling X.get() here would result in a panic.
+    ///
+    /// X.set(123); // But X.set() is fine, as it skips the initializer above.
+    ///
+    /// assert_eq!(X.get(), 123);
+    /// ```
+    pub fn set(&'static self, t: T) {
+        self.initialize_with(Cell::new(t), |value, cell| {
+            if let Some(value) = value {
+                // The cell was already initialized, so `value` wasn't used to
+                // initialize it. So we overwrite the current value with the
+                // new one instead.
+                cell.set(value.into_inner());
+            }
+        });
+    }
+
+    /// Takes the value out of the thread local storage,
+    /// returning `None` if the key is not in the TLS or the destructor is running.
+    ///
+    /// This will lazily initialize the value if this thread has not referenced
+    /// this key yet.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the key currently has its destructor running,
+    /// and it **may** panic if the destructor has previously been run for this thread.
+    /// # Examples
+    /// ```
+    /// use std::cell::Cell;
     /// thread_local! {
     ///     static X: Cell<i32> = const { Cell::new(1) };
     /// }
     ///
-    /// X.set(2);
-    /// assert_eq!(X.get(), 2);
+    /// assert_eq!(X.take(), Some(1));
+    /// assert_eq!(X.take(), None);
     /// ```
-    pub fn set(&'static self, t: T) {
-        self.with(|c| c.set(t))
+    pub fn take(&'static self) -> T
+    where
+        T: Default,
+    {
+        self.with(Cell::take)
     }
 
     /// Replaces the contained value and returns the old value.
@@ -599,6 +683,172 @@ impl<T: 'static> LocalKey<Cell<T>> {
     /// ```
     pub fn replace(&'static self, t: T) -> T {
         self.with(|c| c.replace(t))
+    }
+}
+
+impl<T: 'static> LocalKey<RefCell<T>> {
+    /// Acquires a reference to the contained value.
+    ///
+    /// This will lazily initialize the value if this thread has not referenced
+    /// this key yet.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the value is currently mutably borrowed.
+    ///
+    /// Panics if the key currently has its destructor running,
+    /// and it **may** panic if the destructor has previously been run for this thread.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::cell::RefCell;
+    ///
+    /// thread_local! {
+    ///     static X: RefCell<Vec<i32>> = RefCell::new(Vec::new());
+    /// }
+    ///
+    /// X.with_borrow(|v| assert!(v.is_empty()));
+    /// ```
+    pub fn with_borrow<F, R>(&'static self, f: F) -> R
+    where
+        F: FnOnce(&T) -> R,
+    {
+        self.with(|cell| f(&cell.borrow()))
+    }
+
+    /// Acquires a mutable reference to the contained value.
+    ///
+    /// This will lazily initialize the value if this thread has not referenced
+    /// this key yet.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the value is currently borrowed.
+    ///
+    /// Panics if the key currently has its destructor running,
+    /// and it **may** panic if the destructor has previously been run for this thread.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::cell::RefCell;
+    ///
+    /// thread_local! {
+    ///     static X: RefCell<Vec<i32>> = RefCell::new(Vec::new());
+    /// }
+    ///
+    /// X.with_borrow_mut(|v| v.push(1));
+    ///
+    /// X.with_borrow(|v| assert_eq!(*v, vec![1]));
+    /// ```
+    pub fn with_borrow_mut<F, R>(&'static self, f: F) -> R
+    where
+        F: FnOnce(&mut T) -> R,
+    {
+        self.with(|cell| f(&mut cell.borrow_mut()))
+    }
+
+    /// Sets or initializes the contained value.
+    ///
+    /// Unlike the other methods, this will *not* run the lazy initializer of
+    /// the thread local. Instead, it will be directly initialized with the
+    /// given value if it wasn't initialized yet.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the value is currently borrowed.
+    ///
+    /// Panics if the key currently has its destructor running,
+    /// and it **may** panic if the destructor has previously been run for this thread.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::cell::RefCell;
+    ///
+    /// thread_local! {
+    ///     static X: RefCell<Vec<i32>> = panic!("!");
+    /// }
+    ///
+    /// // Calling X.with() here would result in a panic.
+    ///
+    /// X.set(vec![1, 2, 3]); // But X.set() is fine, as it skips the initializer above.
+    ///
+    /// X.with_borrow(|v| assert_eq!(*v, vec![1, 2, 3]));
+    /// ```
+    pub fn set(&'static self, value: T) {
+        self.initialize_with(RefCell::new(value), |value, cell| {
+            if let Some(value) = value {
+                // The cell was already initialized, so `value` wasn't used to
+                // initialize it. So we overwrite the current value with the
+                // new one instead.
+                *cell.borrow_mut() = value.into_inner();
+            }
+        });
+    }
+
+    /// Takes the contained value, leaving `Default::default()` in its place.
+    ///
+    /// This will lazily initialize the value if this thread has not referenced
+    /// this key yet.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the value is currently borrowed.
+    ///
+    /// Panics if the key currently has its destructor running,
+    /// and it **may** panic if the destructor has previously been run for this thread.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::cell::RefCell;
+    ///
+    /// thread_local! {
+    ///     static X: RefCell<Vec<i32>> = RefCell::new(Vec::new());
+    /// }
+    ///
+    /// X.with_borrow_mut(|v| v.push(1));
+    ///
+    /// let a = X.take();
+    ///
+    /// assert_eq!(a, vec![1]);
+    ///
+    /// X.with_borrow(|v| assert!(v.is_empty()));
+    /// ```
+    pub fn take(&'static self) -> T
+    where
+        T: Default,
+    {
+        self.with(RefCell::take)
+    }
+
+    /// Replaces the contained value, returning the old value.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the value is currently borrowed.
+    ///
+    /// Panics if the key currently has its destructor running,
+    /// and it **may** panic if the destructor has previously been run for this thread.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::cell::RefCell;
+    ///
+    /// thread_local! {
+    ///     static X: RefCell<Vec<i32>> = RefCell::new(Vec::new());
+    /// }
+    ///
+    /// let prev = X.replace(vec![1, 2, 3]);
+    /// assert!(prev.is_empty());
+    ///
+    /// X.with_borrow(|v| assert_eq!(*v, vec![1, 2, 3]));
+    /// ```
+    pub fn replace(&'static self, value: T) -> T {
+        self.with(|cell| cell.replace(value))
     }
 }
 
