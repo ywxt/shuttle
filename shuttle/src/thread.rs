@@ -554,6 +554,31 @@ impl<T: 'static> LocalKey<Cell<T>> {
     {
         self.with(Cell::get)
     }
+
+    /// Sets the contained value.
+    ///
+    /// This will lazily initialize the value if this thread has not referenced
+    /// this key yet.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the key currently has its destructor running,
+    /// and it **may** panic if the destructor has previously been run for this thread.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::cell::Cell;
+    /// thread_local! {
+    ///     static X: Cell<i32> = const { Cell::new(1) };
+    /// }
+    /// 
+    /// X.set(2);
+    /// assert_eq!(X.get(), 2);
+    /// ```
+    pub fn set(&'static self, t: T) {
+        self.with(|c| c.set(t))
+    }
 }
 
 /// An error returned by [`LocalKey::try_with`]

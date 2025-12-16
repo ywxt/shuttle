@@ -111,6 +111,32 @@ fn thread_scope_join() {
 }
 
 #[test]
+fn builder_scope() {
+    shuttle::thread_local! {
+        static TRIGGER: std::cell::RefCell<bool> = std::cell::RefCell::new(false);
+    }
+    check_dfs(
+        || {
+            let trigger = std::sync::Mutex::new(false);
+            let builder = thread::Builder::new().name("test".into());
+            thread::scope(|s| {
+                builder
+                    .spawn_scoped(s, || {
+                        println!("thread: {:?}", thread::current().id());
+                        *trigger.lock().unwrap() = true;
+                        TRIGGER.with(|t| *t.borrow_mut() = true);
+                    })
+                    .unwrap();
+            });
+            println!("main: {:?}", std::thread::current().id());
+            assert!(&*trigger.lock().unwrap());
+            assert!(TRIGGER.with(|t| *t.borrow()));
+        },
+        None,
+    );
+}
+
+#[test]
 fn thread_join() {
     check_random(
         || {
